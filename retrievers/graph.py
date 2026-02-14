@@ -1,5 +1,5 @@
 from typing import List, Dict, Any
-from langchain.schema import Document
+from langchain_core.documents import Document
 import spacy
 from neo4j import GraphDatabase
 import json
@@ -55,10 +55,13 @@ class GraphRetriever:
         """Initialize the Neo4j database schema with constraints."""
         try:
             with self.driver.session() as session:
-                # Create constraints for unique nodes
                 session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (d:Document) REQUIRE d.id IS UNIQUE")
                 session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (p:Person) REQUIRE p.name IS UNIQUE")
                 session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (c:Company) REQUIRE c.name IS UNIQUE")
+                # Basketball schema
+                session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (t:Team) REQUIRE t.name IS UNIQUE")
+                session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (p:Player) REQUIRE p.name IS UNIQUE")
+                session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (c:Coach) REQUIRE c.name IS UNIQUE")
             logger.info("Successfully initialized Neo4j schema")
         except Exception as e:
             logger.error(f"Failed to initialize schema: {str(e)}")
@@ -149,60 +152,138 @@ class GraphRetriever:
             logger.error(f"Failed to add document: {str(e)}")
             raise
     
+    def _tokenize(self, query: str) -> List[str]:
+        """Build search tokens from query (full phrase, no spaces, and words > 2 chars)."""
+        q = query.strip().lower()
+        return [q, q.replace(" ", "")] + [w for w in q.split() if len(w) > 2]
+
+    def _run_entity_queries(self, session, tokens: List[str]) -> List[str]:
+        """Run token-driven entity lookups (Team, Player, Coach) from a single config."""
+        # One pattern: match by tokens, optional relationships, return structured row. Formatter turns row into text.
+        entity_config = [
+            (
+                """
+                MATCH (t:Team)
+                WHERE any(n IN $tokens WHERE toLower(t.name) CONTAINS n OR n CONTAINS toLower(t.name))
+                OPTIONAL MATCH (c:Coach)-[:COACHES]->(t)
+                OPTIONAL MATCH (p:Player)-[r:PLAYS_FOR]->(t)
+                RETURN t.name AS team, t.city AS city, c.name AS coach,
+                       collect(DISTINCT {name: p.name, ppg: r.ppg, career_high: r.career_high}) AS players
+                """,
+                lambda rec: self._format_team_row(rec),
+            ),
+            (
+                """
+                MATCH (p:Player)-[r:PLAYS_FOR]->(t:Team)
+                WHERE any(n IN $tokens WHERE toLower(p.name) CONTAINS n OR n CONTAINS toLower(p.name))
+                OPTIONAL MATCH (p)-[:TEAMMATE_OF]->(m:Player)
+                RETURN p.name AS player, t.name AS team, r.ppg AS ppg, r.career_high AS career_high,
+                       collect(DISTINCT m.name) AS teammates
+                """,
+                lambda rec: self._format_player_row(rec),
+            ),
+            (
+                """
+                MATCH (c:Coach)-[:COACHES]->(t:Team)
+                WHERE any(n IN $tokens WHERE toLower(c.name) CONTAINS n OR n CONTAINS toLower(c.name))
+                OPTIONAL MATCH (p:Player)-[r:PLAYS_FOR]->(t)
+                RETURN c.name AS coach, t.name AS team, collect(DISTINCT {name: p.name, ppg: r.ppg}) AS players
+                """,
+                lambda rec: self._format_coach_row(rec),
+            ),
+        ]
+        facts = []
+        for cypher, formatter in entity_config:
+            for rec in session.run(cypher, tokens=tokens):
+                line = formatter(rec)
+                if line:
+                    facts.append(line)
+        return facts
+
+    def _format_team_row(self, rec: Dict[str, Any]) -> str:
+        team, city, coach, players = rec.get("team"), rec.get("city"), rec.get("coach"), rec.get("players") or []
+        if not team:
+            return ""
+        parts = [f"Team: {team}" + (f" ({city})" if city else "")]
+        if coach:
+            parts.append(f"Coach: {coach}")
+        for x in players:
+            if x.get("name"):
+                parts.append(f"Player: {x['name']}" + (f", PPG: {x.get('ppg')}, Career high: {x.get('career_high')}" if x.get("ppg") is not None else ""))
+        return " | ".join(parts) if len(parts) > 1 else ""
+
+    def _format_player_row(self, rec: Dict[str, Any]) -> str:
+        player = rec.get("player")
+        if not player:
+            return ""
+        team, ppg, ch = rec.get("team"), rec.get("ppg"), rec.get("career_high")
+        mates = [m for m in (rec.get("teammates") or []) if m]
+        parts = [f"Player: {player}", f"Team: {team}"]
+        if ppg is not None:
+            parts.append(f"PPG: {ppg}")
+        if ch is not None:
+            parts.append(f"Career high: {ch}")
+        if mates:
+            parts.append(f"Teammates: {', '.join(mates)}")
+        return " | ".join(parts)
+
+    def _format_coach_row(self, rec: Dict[str, Any]) -> str:
+        coach, team = rec.get("coach"), rec.get("team")
+        if not coach:
+            return ""
+        players = rec.get("players") or []
+        parts = [f"Coach: {coach}", f"Team: {team}"]
+        for x in players:
+            if x.get("name"):
+                parts.append(f"Player: {x['name']}" + (f" (PPG: {x.get('ppg')})" if x.get("ppg") is not None else ""))
+        return " | ".join(parts)
+
+    def _run_relationship_queries(self, session, query_lower: str, tokens: List[str]) -> List[str]:
+        """Run relationship lookups when query contains trigger words; all use tokens to scope."""
+        # (trigger_substrings, cypher, row formatter)
+        rel_config = [
+            (
+                ["teammate", "teammates", "plays with"],
+                """
+                MATCH (a:Player)-[:TEAMMATE_OF]->(b:Player)
+                WHERE any(n IN $tokens WHERE toLower(a.name) CONTAINS n OR n CONTAINS toLower(a.name))
+                RETURN a.name AS a, b.name AS b
+                """,
+                lambda rec: f"Teammates: {rec['a']} and {rec['b']}" if rec.get("a") and rec.get("b") else "",
+            ),
+        ]
+        facts = []
+        for triggers, cypher, formatter in rel_config:
+            if not any(t in query_lower for t in triggers):
+                continue
+            for rec in session.run(cypher, tokens=tokens):
+                line = formatter(rec)
+                if line:
+                    facts.append(line)
+        return facts
+
     def retrieve(self, query: str, k: int = 5) -> List[Document]:
-        """Retrieve documents based on entity relationships.
-        
-        Args:
-            query (str): The query string
-            k (int): Number of documents to retrieve
-            
-        Returns:
-            List[Document]: List of retrieved documents
-        """
+        """Retrieve from basketball graph using tokenized query; entity and relationship lookups are config-driven."""
         try:
-            entities = self.extract_entities(query)
-            
+            q_lower = query.strip().lower()
+            tokens = self._tokenize(query)
+            facts = []
             with self.driver.session() as session:
-                # Build the Cypher query based on extracted entities
-                cypher_query = """
-                MATCH (d:Document)
-                WHERE """
-                
-                conditions = []
-                params = {}
-                
-                for entity_type, values in entities.items():
-                    for i, value in enumerate(values):
-                        if entity_type == "PERSON":
-                            conditions.append(f"EXISTS((d)-[:MENTIONS]->(:Person {{name: $person{i}}}))")
-                            params[f"person{i}"] = value
-                        elif entity_type == "ORG":
-                            conditions.append(f"EXISTS((d)-[:MENTIONS]->(:Company {{name: $org{i}}}))")
-                            params[f"org{i}"] = value
-                
-                if not conditions:
-                    # If no entities found, try full-text search
-                    cypher_query = """
-                    MATCH (d:Document)
-                    WHERE d.content CONTAINS $search_text
-                    RETURN d LIMIT $k
-                    """
-                    params = {"search_text": query, "k": k}
-                else:
-                    cypher_query += " OR ".join(conditions)
-                    cypher_query += f" RETURN d LIMIT {k}"
-                
-                results = session.run(cypher_query, **params)
-                documents = []
-                
-                for record in results:
-                    doc = Document(
-                        page_content=record["d"]["content"],
-                        metadata={"retrieval_source": "graph"}
-                    )
-                    documents.append(doc)
-                
-                return documents
+                facts.extend(self._run_entity_queries(session, tokens))
+                facts.extend(self._run_relationship_queries(session, q_lower, tokens))
+
+            seen = set()
+            unique = []
+            for f in facts:
+                if f and f not in seen:
+                    seen.add(f)
+                    unique.append(f)
+            if not unique:
+                unique = ["Graph has teams (Celtics, Lakers, Warriors), players, and coaches. Ask by name, e.g. 'Who coaches the Lakers?' or 'Jayson Tatum stats'."]
+            return [
+                Document(page_content=text, metadata={"retrieval_source": "graph"})
+                for text in unique[:k]
+            ]
         except Exception as e:
             logger.error(f"Failed to retrieve documents: {str(e)}")
             return []
